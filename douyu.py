@@ -1,137 +1,155 @@
-# 获取斗鱼直播间的真实流媒体地址，默认最高画质
-# 使用 https://github.com/wbt5/real-url/issues/185 中两位大佬@wjxgzz @4bbu6j5885o3gpv6ss8找到的的CDN，在此感谢！
+# 获取斗鱼直播间的真实流媒体地址，默认最高画质。
+# 参考 biliup 项目：使用 getEncryption 加密密钥 API，无需 execjs。
 import hashlib
-import re
 import time
 
-import execjs
 import requests
+
+DOUYU_DID = "10000000000000000000000000001501"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _md5(data: str) -> str:
+    return hashlib.md5(data.encode()).hexdigest()
+
+
+def _sign_stream(encrypt_key: dict, room_id: str, ts: int) -> str:
+    """计算斗鱼播放接口的 auth 签名。"""
+    salt = "" if encrypt_key.get("is_special") == 1 else f"{room_id}{ts}"
+    secret = encrypt_key["rand_str"]
+    for _ in range(encrypt_key["enc_time"]):
+        secret = _md5(f"{secret}{encrypt_key['key']}")
+    return _md5(f"{secret}{encrypt_key['key']}{salt}")
 
 
 class DouYu:
-    """
-    可用来替换返回链接中的主机部分
-    两个阿里的CDN：
-    dyscdnali1.douyucdn.cn
-    dyscdnali3.douyucdn.cn
-    墙外不用带尾巴的akm cdn：
-    hls3-akm.douyucdn.cn
-    hlsa-akm.douyucdn.cn
-    hls1a-akm.douyucdn.cn
-    """
 
     def __init__(self, rid):
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": UA,
+            "Referer": "https://www.douyu.com",
+        })
+
+        # 1. 从移动端页面获取真实 rid
+        rid = self._resolve_room_id(str(rid))
+
+        # 2. 获取直播状态
+        room_info = self._get_room_info(rid)
+        if room_info is None:
+            raise Exception("未开播")
+        self.rid = rid
+        self.room_name = room_info["room_name"]
+
+        # 3. 获取加密密钥
+        self._encrypt_key = self._get_encryption()
+
+    def _resolve_room_id(self, short_id: str) -> str:
+        """从短房间号解析真实 rid。"""
+        resp = self._session.get(f"https://m.douyu.com/{short_id}", timeout=10)
+        text = resp.text
+
+        import re
+        m = re.search(r'"roomInfo":\{"rid":(\d+)', text)
+        if m:
+            return m.group(1)
+
+        # 如果本身就是纯数字 rid
+        if short_id.isdigit():
+            return short_id
+
+        raise Exception("房间号解析失败")
+
+    def _get_room_info(self, room_id: str) -> dict | None:
+        """获取直播间信息。"""
+        resp = self._session.get(
+            f"https://www.douyu.com/betard/{room_id}",
+            headers={"Referer": "https://www.douyu.com"},
+            timeout=10,
+        ).json()
+
+        room = resp.get("room")
+        if room is None:
+            return None
+        if room.get("show_status") != 1 or room.get("videoLoop", 0) != 0:
+            return None
+        return room
+
+    def _get_encryption(self) -> dict:
+        """获取斗鱼白盒加密密钥。"""
+        resp = self._session.get(
+            "https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption",
+            params={"did": DOUYU_DID},
+            timeout=10,
+        ).json()
+
+        if resp.get("error") != 0:
+            raise Exception(f"获取加密密钥失败: {resp.get('msg', '')}")
+        if resp.get("data") is None:
+            raise Exception("加密密钥为空")
+
+        return resp["data"]
+
+    def get_real_url(self, cdn: str = "", rate: int = 0) -> dict:
         """
-        房间号通常为1~8位纯数字，浏览器地址栏中看到的房间号不一定是真实rid.
-        Args:
-            rid:
+        返回直播流地址。
+        cdn: 空=自动, ws-h5=主线路, tct-h5=备用线路
+        rate: 0=蓝光最高, 1=流畅, 2=高清, 3=超清, 4=蓝光4M
         """
-        self.did = '10000000000000000000000000001501'
-        self.t10 = str(int(time.time()))
-        self.t13 = str(int((time.time() * 1000)))
+        now = int(time.time())
+        auth = _sign_stream(self._encrypt_key, self.rid, now)
 
-        self.s = requests.Session()
-        self.res = self.s.get('https://m.douyu.com/' + str(rid)).text
-        result = re.search(r'rid":(\d{1,8}),"vipId', self.res)
-
-        if result:
-            self.rid = result.group(1)
-        else:
-            raise Exception('房间号错误')
-
-    @staticmethod
-    def md5(data):
-        return hashlib.md5(data.encode('utf-8')).hexdigest()
-
-    def get_pre(self):
-        url = 'https://playweb.douyucdn.cn/lapi/live/hlsH5Preview/' + self.rid
-        data = {
-            'rid': self.rid,
-            'did': self.did
+        form = {
+            "cdn": cdn,
+            "rate": str(rate),
+            "ver": "Douyu_new",
+            "iar": "0",
+            "ive": "0",
+            "rid": self.rid,
+            "hevc": "0",
+            "fa": "0",
+            "sov": "0",
+            "enc_data": self._encrypt_key["enc_data"],
+            "tt": str(now),
+            "did": DOUYU_DID,
+            "auth": auth,
         }
-        auth = DouYu.md5(self.rid + self.t13)
-        headers = {
-            'rid': self.rid,
-            'time': self.t13,
-            'auth': auth
-        }
-        res = self.s.post(url, headers=headers, data=data).json()
-        error = res['error']
-        data = res['data']
-        key = ''
-        if data:
-            rtmp_live = data['rtmp_live']
-            key = re.search(r'(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(/playlist|.m3u8)', rtmp_live).group(1)
-        return error, key
 
-    def get_js(self):
-        result = re.search(r'(function ub98484234.*)\s(var.*)', self.res).group()
-        func_ub9 = re.sub(r'eval.*;}', 'strc;}', result)
-        js = execjs.compile(func_ub9)
-        res = js.call('ub98484234')
+        resp = self._session.post(
+            f"https://www.douyu.com/lapi/live/getH5PlayV1/{self.rid}",
+            data=form,
+            timeout=10,
+        ).json()
 
-        v = re.search(r'v=(\d+)', res).group(1)
-        rb = DouYu.md5(self.rid + self.did + self.t10 + v)
+        error = resp.get("error", -1)
+        msg = resp.get("msg", "")
 
-        func_sign = re.sub(r'return rt;}\);?', 'return rt;}', res)
-        func_sign = func_sign.replace('(function (', 'function sign(')
-        func_sign = func_sign.replace('CryptoJS.MD5(cb).toString()', '"' + rb + '"')
-
-        js = execjs.compile(func_sign)
-        params = js.call('sign', self.rid, self.did, self.t10)
-        params += '&ver=219032101&rid={}&rate=-1'.format(self.rid)
-
-        url = 'https://m.douyu.com/api/room/ratestream'
-        res = self.s.post(url, params=params).text
-        key = re.search(r'(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(.m3u8|/playlist)', res).group(1)
-
-        return key
-
-    def get_pc_js(self, cdn='ws-h5', rate=0):
-        """
-        通过PC网页端的接口获取完整直播源。
-        :param cdn: 主线路ws-h5、备用线路tct-h5
-        :param rate: 1流畅；2高清；3超清；4蓝光4M；0蓝光8M或10M
-        :return: JSON格式
-        """
-        res = self.s.get('https://www.douyu.com/' + str(self.rid)).text
-        result = re.search(r'(vdwdae325w_64we[\s\S]*function ub98484234[\s\S]*?)function', res).group(1)
-        func_ub9 = re.sub(r'eval.*?;}', 'strc;}', result)
-        js = execjs.compile(func_ub9)
-        res = js.call('ub98484234')
-
-        v = re.search(r'v=(\d+)', res).group(1)
-        rb = DouYu.md5(self.rid + self.did + self.t10 + v)
-
-        func_sign = re.sub(r'return rt;}\);?', 'return rt;}', res)
-        func_sign = func_sign.replace('(function (', 'function sign(')
-        func_sign = func_sign.replace('CryptoJS.MD5(cb).toString()', '"' + rb + '"')
-
-        js = execjs.compile(func_sign)
-        params = js.call('sign', self.rid, self.did, self.t10)
-
-        params += '&cdn={}&rate={}'.format(cdn, rate)
-        url = 'https://www.douyu.com/lapi/live/getH5Play/{}'.format(self.rid)
-        res = self.s.post(url, params=params).json()
-
-        return res
-
-    def get_real_url(self):
-        error, key = self.get_pre()
-        if error == 0:
-            pass
-        elif error == 102:
-            raise Exception('房间不存在')
-        elif error == 104:
-            raise Exception('房间未开播')
+        if error == 0 and resp.get("data"):
+            data = resp["data"]
+            key = data["rtmp_live"]
+            rtmp_url = data["rtmp_url"]
+            return {
+                "flv": f"{rtmp_url}/{key}",
+            }
+        elif error == -5:
+            raise Exception("主播未开播")
+        elif error == 126:
+            raise Exception(f"版权限制: {msg}")
         else:
-            key = self.get_js()
-        real_url = {}
-        real_url["flv"] = "http://vplay1a.douyucdn.cn/live/{}.flv?uuid=".format(key)
-        real_url["x-p2p"] = "http://tx2play1.douyucdn.cn/live/{}.xs?uuid=".format(key)
-        return real_url
+            raise Exception(f"获取播放信息失败 (code={error}): {msg}")
 
-if __name__ == '__main__':
-    r = input('输入斗鱼直播间号：\n')
-    s = DouYu(r)
-    print(s.get_real_url())
+
+def get_real_url(rid):
+    try:
+        dy = DouYu(rid)
+        return dy.get_real_url()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+if __name__ == "__main__":
+    rid = input("输入斗鱼直播间号：\n").strip()
+    urls = get_real_url(rid)
+    for k, v in urls.items():
+        print(f"{k}: {v}")

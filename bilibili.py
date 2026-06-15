@@ -1,86 +1,132 @@
-# 获取哔哩哔哩直播的真实流媒体地址，默认获取直播间提供的最高画质
-# qn=150高清
-# qn=250超清
-# qn=400蓝光
-# qn=10000原画
+# 获取哔哩哔哩直播的真实流媒体地址，默认最高画质。
+# 参考 biliup 项目：使用 WBI 签名 + getInfoByRoom API。
+import hashlib
+import time
+import urllib.parse
+from functools import reduce
+
 import requests
 
+API_BASE = "https://api.live.bilibili.com"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+# ---- WBI 签名 ----
+
+_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+
+def _get_mixin_key(raw: str) -> str:
+    return reduce(lambda s, i: s + raw[i], _MIXIN_KEY_ENC_TAB, "")[:32]
+
+
+def _fetch_wbi_keys(session: requests.Session) -> tuple:
+    """从 nav 接口获取 img_key 和 sub_key。"""
+    resp = session.get("https://api.bilibili.com/x/web-interface/nav",
+                       headers={"User-Agent": UA}, timeout=10)
+    data = resp.json()["data"]
+    img_url = data["wbi_img"]["img_url"]
+    sub_url = data["wbi_img"]["sub_url"]
+    img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+    sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+    return img_key, sub_key
+
+
+def sign_params(params: dict, img_key: str, sub_key: str) -> dict:
+    """对参数字典进行 WBI 签名，添加 w_rid 和 wts。"""
+    mixin = _get_mixin_key(img_key + sub_key)
+    params = dict(sorted(params.items()))
+    params["wts"] = str(int(time.time()))
+    query = urllib.parse.urlencode(params)
+    params["w_rid"] = hashlib.md5((query + mixin).encode()).hexdigest()
+    return params
+
+
+# ---- Bilibili API ----
 
 class BiliBili:
 
     def __init__(self, rid):
-        """
-        有些地址无法在PotPlayer播放，建议换个播放器试试
-        Args:
-            rid:
-        """
-        rid = rid
-        self.header = {
-            'User-Agent': 'Mozilla/5.0 (iPod; CPU iPhone OS 14_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, '
-                          'like Gecko) CriOS/87.0.4280.163 Mobile/15E148 Safari/604.1',
-        }
-        # 先获取直播状态和真实房间号
-        r_url = 'https://api.live.bilibili.com/room/v1/Room/room_init'
-        param = {
-            'id': rid
-        }
-        with requests.Session() as self.s:
-            res = self.s.get(r_url, headers=self.header, params=param).json()
-        if res['msg'] == '直播间不存在':
-            raise Exception(f'bilibili {rid} {res["msg"]}')
-        live_status = res['data']['live_status']
-        if live_status != 1:
-            raise Exception(f'bilibili {rid} 未开播')
-        self.real_room_id = res['data']['room_id']
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": UA, "Referer": "https://live.bilibili.com"})
 
-    def get_real_url(self, current_qn: int = 10000) -> dict:
-        url = 'https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo'
-        param = {
-            'room_id': self.real_room_id,
-            'protocol': '0,1',
-            'format': '0,1,2',
-            'codec': '0,1',
-            'qn': current_qn,
-            'platform': 'h5',
-            'ptype': 8,
-        }
-        res = self.s.get(url, headers=self.header, params=param).json()
-        stream_info = res['data']['playurl_info']['playurl']['stream']
-        qn_max = 0
+        # 获取 WBI 签名密钥
+        self._img_key, self._sub_key = _fetch_wbi_keys(self._session)
 
-        for data in stream_info:
-            accept_qn = data['format'][0]['codec'][0]['accept_qn']
-            for qn in accept_qn:
-                qn_max = qn if qn > qn_max else qn_max
-        if qn_max != current_qn:
-            param['qn'] = qn_max
-            res = self.s.get(url, headers=self.header, params=param).json()
-            stream_info = res['data']['playurl_info']['playurl']['stream']
+        # 获取房间信息
+        params = sign_params({"room_id": str(rid), "web_location": "444.8"},
+                             self._img_key, self._sub_key)
+        resp = self._session.get(f"{API_BASE}/xlive/web-room/v1/index/getInfoByRoom",
+                                 params=params, timeout=10).json()
 
-        stream_urls = {}
-        # flv流无法播放，暂修改成获取hls格式的流，
-        for data in stream_info:
-            format_name = data['format'][0]['format_name']
-            if format_name == 'ts':
-                base_url = data['format'][-1]['codec'][0]['base_url']
-                url_info = data['format'][-1]['codec'][0]['url_info']
-                for i, info in enumerate(url_info):
-                    host = info['host']
-                    extra = info['extra']
-                    stream_urls[f'线路{i + 1}'] = f'{host}{base_url}{extra}'
-                break
-        return stream_urls
+        if resp["code"] != 0:
+            raise Exception(resp.get("message", "房间不存在"))
+
+        room = resp["data"]["room_info"]
+        if room["live_status"] != 1:
+            raise Exception("未开播")
+
+        self.room_id = room["room_id"]
+        self.title = room["title"]
+        self.uid = room["uid"]
+
+    def get_real_url(self, qn: int = 10000) -> dict:
+        """返回所有可用的 HLS (m3u8) 流地址。qn: 150高清 250超清 400蓝光 10000原画。"""
+        params = sign_params({
+            "room_id": str(self.room_id),
+            "qn": str(qn),
+            "platform": "html5",
+            "protocol": "0,1",
+            "format": "0,1,2",
+            "codec": "0",
+            "dolby": "5",
+            "web_location": "444.8",
+        }, self._img_key, self._sub_key)
+
+        resp = self._session.get(
+            f"{API_BASE}/xlive/web-room/v2/index/getRoomPlayInfo",
+            params=params, timeout=10).json()
+
+        if resp["code"] != 0:
+            raise Exception(resp.get("message", "获取播放信息失败"))
+
+        streams = resp["data"]["playurl_info"]["playurl"]["stream"]
+        result = {}
+
+        for stream in streams:
+            for fmt in stream.get("format", []):
+                format_name = fmt.get("format_name", "")
+                if format_name != "ts":
+                    continue
+                for codec in fmt.get("codec", []):
+                    base = codec.get("base_url", "")
+                    current_qn = codec.get("current_qn", qn)
+                    for i, info in enumerate(codec.get("url_info", [])):
+                        host = info["host"]
+                        extra = info["extra"]
+                        label = f"线路{i + 1}_{current_qn}"
+                        result[label] = f"{host}{base}{extra}"
+                break  # 只取第一种格式 (ts=HLS)
+
+        return result
 
 
-def get_real_url(rid):
+def get_real_url(rid, qn=10000):
     try:
-        bilibili = BiliBili(rid)
-        return bilibili.get_real_url()
+        bb = BiliBili(rid)
+        return bb.get_real_url(qn)
     except Exception as e:
-        print('Exception：', e)
-        return False
+        return {"error": str(e)}
 
 
-if __name__ == '__main__':
-    r = input('请输入bilibili直播房间号：\n')
-    print(get_real_url(r))
+if __name__ == "__main__":
+    rid = input("输入B站直播间号：\n").strip()
+    urls = get_real_url(rid)
+    for k, v in urls.items():
+        print(f"{k}: {v}")
