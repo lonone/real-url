@@ -22,7 +22,7 @@
 
 ## 反馈
 
-有直播平台失效或新增其他平台解析的，可发 [issue](https://github.com/wbt5/real-url/issues/new)。
+有直播平台失效或新增其他平台解析的，可发 [issue](https://github.com/lonone/real-url/issues/new)。
 
 ## 更新
 
